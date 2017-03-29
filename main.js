@@ -291,7 +291,6 @@
         return $.get("https://reservations.synxis.com/HMS/Room/GetRoomTypeItems")
             .pipe(function(data) {
                 featureWindow.roomTypeCache = data.rows.map(function(row) {
-                    console.log(row);
                     return {
                         id: row.id,
                         category: row.cell[1],
