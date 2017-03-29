@@ -11,6 +11,16 @@
         else return this.truncate(--n);
     };
 
+    String.prototype.toDate = function() {
+        var parts = this.split("/");
+        return new Date(parts[2].length === 2 ? "20" + parts[2] : parts[2], parts[1] - 1, parts[0]);
+    };
+
+    Date.prototype.getMonthName = function() {
+        var monthNames = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+        return monthNames[this.getMonth()];
+    };
+
     jQuery.expr[':'].CIeq = function(a, i, m) {
         return (a.textContent || a.innerText || "").toUpperCase() === m[3].toUpperCase();
     };
@@ -23,6 +33,7 @@
     var baumImage = null;
     var isFormConfirm = true;
     var sessionCounter = 0;
+    var emptyGUID = "00000000-0000-0000-0000-000000000000";
 
     var initGlobals = function() {
 
@@ -119,11 +130,6 @@
                 .find("#clearNaughtyfies")
                 .click(function() {
                     PNaughtyfy.removeAll();
-                    /*getAllCommissionPolicies().then(data => {
-                        console.log(data);
-                        postNewCommissionPolicy("TestKTB11", 11).then(console.log("Posted"));
-                    });*/
-                    processNewRates();
                 });
         }
 
@@ -285,6 +291,7 @@
         return $.get("https://reservations.synxis.com/HMS/Room/GetRoomTypeItems")
             .pipe(function(data) {
                 featureWindow.roomTypeCache = data.rows.map(function(row) {
+                    console.log(row);
                     return {
                         id: row.id,
                         category: row.cell[1],
@@ -328,6 +335,12 @@
             isTaxInclusive: {
                 name: "Tax Inclusive", index: null
             },
+            seasonStart: {
+                name: "Rate Start Date", index: null
+            },
+            seasonEnd: {
+                name: "Rate valid until", index: null
+            },
             roomTypesRepeatStart: {
                 name: "Room Type / Price", index: null
             }
@@ -353,6 +366,22 @@
             }
         };
 
+        var getUniqueRows = (rows) => {
+            var returnRows = [];
+            for (var i = 0; i < rows.length; i++) {
+                var found = returnRows.find(returnRow => {
+                    var returnRowCells = returnRow.split("\t");
+                    var rowCells = rows[i].split("\t");
+                    return returnRowCells[rateFields.fullName.index] === rowCells[rateFields.fullName.index] &&
+                            returnRowCells[rateFields.nameSuffix.index] === rowCells[rateFields.nameSuffix.index];
+                });
+                if (!found) {
+                    returnRows.push(rows[i]);
+                }
+            }
+            return returnRows;
+        };
+
         var mapSuffixToCodeSuffix = (suffix, mapping) => {
 
             switch (suffix) {
@@ -371,27 +400,42 @@
             }
         };
 
-        var getListOfRoomTypesForRate = (fields, cells) => {
-            var roomTypeNames = [];
-            for (var i = fields.roomTypesRepeatStart.index; !!cells[i]; i += 2) {
-                roomTypeNames.push(cells[i]);
+        var getListOfRoomTypesAndPricesForRate = (fields, cells) => {
+            var roomTypes = [];
+            for (var i = fields.roomTypesRepeatStart.index; i < fields.roomTypesRepeatStart.index + 20; i += 2) {
+                cells[i] && roomTypes.push({ name: cells[i], price: cells[i+1] });
             }
-            return roomTypeNames;
+            return roomTypes;
         };
 
-        var mapListOfRoomTypeNamesToListOfRoomTypeIds = function(roomTypeNames, roomTypes) {
-            return roomTypeNames.map(roomTypeName => roomTypes.filter(roomType => roomType.name === roomTypeName)[0].id);
+        var mapListOfRoomTypeNamesToListOfRoomTypeIds = function(roomTypeNamesAndPrices, roomTypes) {
+            return roomTypeNamesAndPrices.map(roomTypeNameAndPrice => {
+                var found = roomTypes.filter(roomType => roomType.name === roomTypeNameAndPrice.name);
+                if (found[0]) {
+                    return {
+                        UniqueID: found[0].id,
+                        DefaultName: found[0].name,
+                        Code: found[0].code,
+                        RatePrice: roomTypeNameAndPrice.price.substring(3)
+                    };
+                }
+            });
+        };
+
+        var getCurrentlySelectedHotelId = function() {
+            return $("#header_HotelUniqueIdHiddenField").val();
         };
 
         mapColsToIndexes(rateFields, rows[0]);
-        rows = rows.slice(1);
+        rows = rows.slice(1); // remove headers
+        rows = getUniqueRows(rows);
 
         // check that all fields have been mapped
 
         var mainNotice = new PNaughtyfy({
             type: "info",
             title: "Urchis!",
-            text: rows.length + " entries are being processed..",
+            text: rows.length + " unique entries are being processed..",
             styling: "jqueryui",
             hide: false
         });
@@ -410,7 +454,9 @@
                     var isCommissioned = cells[rateFields.isCommissioned.index] === "Commissionable";
                     var commissionAmount = cells[rateFields.commissionAmount.index];
                     var isTaxInclusive = cells[rateFields.isTaxInclusive.index] === "Yes";
-                    var roomTypeNames = getListOfRoomTypesForRate(rateFields, cells);
+                    var seasonStartDate = cells[rateFields.seasonStart.index];
+                    var seasonEndDate = cells[rateFields.seasonEnd.index];
+                    var roomTypeNames = getListOfRoomTypesAndPricesForRate(rateFields, cells);
 
                     code += mapSuffixToCodeSuffix(nameSuffix, suffixToCodeSuffixMap);
                     var commissionPolicyPercentage = isCommissioned ? getCommissionPolicyPercentageFromCode(commissionAmount) : null;
@@ -422,26 +468,50 @@
 
                             var assignedRoomTypes = mapListOfRoomTypeNamesToListOfRoomTypeIds(roomTypeNames, roomTypes);
 
-                            postNewRate(fullName, nameSuffix, code, code, assignedRoomTypes, policy && policy.id, isTaxInclusive);
-                        });
-                    });
+                            postNewRate(fullName, nameSuffix, code, code, assignedRoomTypes, policy && policy.id, isTaxInclusive).always(rateId => {
+
+                                var roomTypeRates = assignedRoomTypes.map(roomType => ({
+                                    PriceSeasonUniqueId: emptyGUID,
+                                    LoyaltyPointsSeasonUniqueId: emptyGUID,
+                                    PricingSeasonTypeId: "0",
+                                    RoomModel: {
+                                        UniqueID: roomType.UniqueID,
+                                        DefaultName: roomType.DefaultName,
+                                        Code: roomType.Code,
+                                        IsActive: "True",
+                                        IsComponentSuite: "False"
+                                    },
+                                    BasePrice: roomType.RatePrice,
+                                    PriceIncludesTax: isTaxInclusive
+                                }));
+
+                                var seasonStartMonthName = seasonStartDate.toDate().getMonthName();
+                                var seasonEndMonthName = seasonEndDate.toDate().getMonthName();
+                                var ratePriceName = seasonStartMonthName + (seasonStartMonthName === seasonEndMonthName ? "" : " - " + seasonEndMonthName);
+
+                                postNewRatePrice(getCurrentlySelectedHotelId(), rateId, fullName + " (" + code + ")", ratePriceName, seasonStartDate, seasonEndDate, roomTypeRates)
+                                    .then(() => successes.push("Uploaded rate info for " + fullName + " " + code),
+                                            error => failures.push("Failed to post new rate price for " + fullName + " " + code));
+                            })/*.catch(error => failures.push("Failed to post new rate for " + fullName + " " + code))*/;
+                        }, error => failures.push("Failed to get room types for " + fullName + " " + code));
+                    }, error => failures.push("Failed to create Commission Policy (" + commissionPolicyName + ") for " + fullName + " " + code));
                 }, 300 * row); // linearly increased delay for each post
             });
         }, 3500); // initial delay after showing first popup
 
-        $(document).ajaxStop(function() {
+        $(document).ajaxStop(() =>
 
             mainNotice.update({
                 type: "success",
                 title: "Urchis Finished",
                 text: "Processing complete!\n\r\n\r" +
-                        "Total Features: " + (successes.length + failures.length + notFounds.length) + "\n\r" +
+                        "Total Rates: " + (successes.length + failures.length + notFounds.length) + "\n\r" +
                         "Total Succeeded: " + successes.length + "\n\r" +
                         "Total Failed: " + failures.length + "\n\r" +
                         "Total Not Found: " + notFounds.length + "\n\r\n\r" +
                         "To see detailed log of this run - click the BAUM!"
-            });
-        });
+            })
+        );
     };
 
     var postNewRate = function(fullName, nameSuffix, code, pmsCode, assignedRoomTypes, commissionPolicyId, isTaxInclusive) {
@@ -453,13 +523,11 @@
         var shortDesc = fullName.truncate(shortDescCharLimit - nameSuffix.length - 1) + " " + nameSuffix;
         var name = fullName.truncate(nameCharLimit - nameSuffix.length - 1) + " " + nameSuffix;
 
-        var defaultGUID = "00000000-0000-0000-0000-000000000000";
-
         var params = $.param({
             "save-continue": "SaveUpdateSubmit",
             "PageNavigationId": "201036",
             "BarApplies": "False",
-            "UniqueID": "00000000-0000-0000-0000-000000000000",
+            "UniqueID": emptyGUID,
             "ModelViewAction": "Add",
             "IsDirty": "False",
             "GlobalDemandProfilesExist": "False",
@@ -501,13 +569,13 @@
             "DisplayLoyaltyPoints": "False",
             "IsMandatory": "False",
             "IsPACorFNSRate": "False",
-            "LuxuryTaxRate.UniqueID": "00000000-0000-0000-0000-000000000000",
+            "LuxuryTaxRate.UniqueID": emptyGUID,
             "LuxuryTaxRate.Name": "",
             "HasAccessToAllowToDesignateRateAsCrsUpdateAndLra": "False",
             "IsCalculatedFromMargin": "False",
             "HotelUsesPerTaxInclusivity": "False",
             "IsActive": "true",
-            "CategoryUniqueId": "00000000-0000-0000-0000-000000000000",
+            "CategoryUniqueId": emptyGUID,
             "RateTypeValue": "1", // Negotiated
             "Code": code, // Code
             "DefaultName": name, // Name
@@ -517,18 +585,18 @@
             "PmsGroupCode": "",
             "RateClassInfoId": "5", // Negotiated
             "CurrencyId": "9", // AUD
-            "DefaultCurrencyRateUniqueId": "00000000-0000-0000-0000-000000000000",
+            "DefaultCurrencyRateUniqueId": emptyGUID,
             "SpecialInstructions": "",
             "BonusPointsAmount": "",
             "DefaultIncludesTax": isTaxInclusive, // Include Tax
             "IsSuppressed": "false",
             "IsBreakfastIncluded": "false",
-            "MealPlanUniqueId": "00000000-0000-0000-0000-000000000000",
+            "MealPlanUniqueId": emptyGUID,
             "DoesHurdleApply": "false",
-            "YieldAsRateUniqueId": "00000000-0000-0000-0000-000000000000",
+            "YieldAsRateUniqueId": emptyGUID,
             "IsMerchant": "false",
             "IsCommissionable": !!commissionPolicyId, // Commissionable
-            "DefaultCommissionPolicyUniqueId": commissionPolicyId || defaultGUID, // Commission Policy
+            "DefaultCommissionPolicyUniqueId": commissionPolicyId || emptyGUID, // Commission Policy
             "IsRedeemable": "false",
             "CredentialsRequired": "false",
             "SecondaryRateAssignmentNotAllowed": "false",
@@ -543,7 +611,7 @@
             "IsMappedAsNegotiatedRate": "false",
             "OriginalDerivationTypeId": "0",
             "DerivationTypeId": "1",
-            "BaseRateUniqueId": "00000000-0000-0000-0000-000000000000",
+            "BaseRateUniqueId": emptyGUID,
             "ExcludedBarRates.ContainerId": "ExcludedBarRatesAssignment",
             "ExcludedBarRates.UnSelectedListHeader": "",
             "ExcludedBarRates.SelectedListHeader": "",
@@ -554,7 +622,7 @@
             "DemandProfileDerivationModel.DerivationFactors": "",
             "DemandProfileDerivationModel.DerivedRoundingRules": "",
             "DemandProfileDerivationModel.RoundToWholeAmountOptions": "",
-            "DemandProfileDerivationModel.RateUniqueId": "00000000-0000-0000-0000-000000000000",
+            "DemandProfileDerivationModel.RateUniqueId": emptyGUID,
             "DemandProfileDerivationModel.CurrencyPrefix": "AUD",
             "DemandProfileDerivationModel.Tiers[0].TierIndex": "1",
             "DemandProfileDerivationModel.Tiers[0].PriceAmount": "0",
@@ -601,17 +669,97 @@
             "HasAccessToConfigureLowestAvailableRateCompare": "False",
             "HasAccessToExcludeLowestAvailableRate": "False",
 
-            "AssignedRooms.PostSelectedList": assignedRoomTypes.join(","),
-            "ChannelAssignment.AssignmentsSetterForPost": assignedRoomTypes.map(roomType => roomType + " 13") // 13 == checked
+            "AssignedRooms.PostSelectedList": assignedRoomTypes.map(roomType => roomType.UniqueID).join(","),
+            "ChannelAssignment.AssignmentsSetterForPost": assignedRoomTypes.map(roomType => roomType.UniqueID + " 13") // 13 == checked
         }, true); // makes serialised param arrays not have []
 
         var deferred = $.Deferred();
 
+        var idSplitter = xhr => {
+            var location = xhr.getResponseHeader("Location");
+            if (location) {
+                var slices = xhr.getResponseHeader("Location").split("/");
+                return slices[slices.length - 1];
+            } else {
+                return "";
+            }
+        };
+
         $.post("https://reservations.synxis.com/HMS/Rate/Create?isMonthlyRate=False&isPACorFNSRate=False", params)
             .then(function(data, status, xhr) {
-                deferred.resolve(xhr.getResponseHeader("Location"));
+                deferred.resolve(idSplitter(xhr));
             }).error(function(xhr) {
-                deferred.resolve(xhr.getResponseHeader("Location"));
+                deferred.resolve(idSplitter(xhr));
+            });
+
+        return deferred.promise();
+    };
+
+    var postNewRatePrice = function(hotelId, rateId, rateNameAndCode, ratePriceName, seasonStartDate, seasonEndDate, roomTypeRates) {
+
+        var params = {
+            "save-continue": "SaveUpdateSubmit",
+            "HotelUniqueId": hotelId,
+            "DisplayLoyaltyPoints": "False",
+            "UniqueID": emptyGUID,
+            "RateModel.UniqueID": rateId,
+            "RateModel.Type": "Base",
+            "PricingSeasonTypeId": "1",
+            "RateModel.NameAndCode": rateNameAndCode,
+            "Name": ratePriceName,
+            "DateRangePickerModel.MinDate.CalendarID": "6155",
+            "DateRangePickerModel.MaxDate.CalendarID": "7251",
+            "DateRangePickerModel.Type": "Range",
+            "DateRangePickerModel.AllowNoEndDate": "True",
+            "DateRangePickerModel.AllowQuickSelection": "True",
+            "DateRangePickerModel.Direction": "Future",
+            "DateRangePickerModel.AllowDaysOfWeekSelection": "False",
+            "DateRangePickerModel.ShowTime": "False",
+            "DateRangePickerModel.SelectedQuickSelectItem": "",
+            "DateRangePickerModel.StartDateCalendarId": "6155",
+            "DateRangePickerModel.StartDate": seasonStartDate,
+            "DateRangePickerModel.StartDate.CalendarId": "6155",
+            "DateRangePickerModel.StartDate_Date": seasonStartDate,
+            "DateRangePickerModel.IsMaxEndDate": "false",
+            "DateRangePickerModel.EndDateCalendarId": "6440",
+            "DateRangePickerModel.EndDate": seasonEndDate,
+            "DateRangePickerModel.EndDate.CalendarId": "6440",
+            "DateRangePickerModel.EndDate_Date": seasonEndDate,
+            "EnableCutoff": "False",
+            "IsCutoffDateRequired": "False",
+            "IsCutoffDaysRequired": "False"
+        };
+
+        for (var i = 0; i < roomTypeRates.length; i++) {
+                params["PricingItems[" + i + "].PriceSeasonUniqueId"] = roomTypeRates[i].PriceSeasonUniqueId;
+                params["PricingItems[" + i + "].LoyaltyPointsSeasonUniqueId"] = roomTypeRates[i].LoyaltyPointsSeasonUniqueId;
+                params["PricingItems[" + i + "].PricingSeasonTypeId"] = roomTypeRates[i].PricingSeasonTypeId;
+                params["PricingItems[" + i + "].RoomModel.UniqueID"] = roomTypeRates[i].RoomModel.UniqueID;
+                params["PricingItems[" + i + "].RoomModel.DefaultName"] = roomTypeRates[i].RoomModel.DefaultName;
+                params["PricingItems[" + i + "].RoomModel.Code"] = roomTypeRates[i].RoomModel.Code;
+                params["PricingItems[" + i + "].RoomModel.IsActive"] = roomTypeRates[i].RoomModel.IsActive;
+                params["PricingItems[" + i + "].RoomModel.IsComponentSuite"] = roomTypeRates[i].RoomModel.IsComponentSuite;
+                params["PricingItems[" + i + "].BasePrice"] = roomTypeRates[i].BasePrice;
+                params["PricingItems[" + i + "].PriceIncludesTax"] = roomTypeRates[i].PriceIncludesTax ? "True" : "False";
+        }
+
+        var deferred = $.Deferred();
+
+        var idSplitter = xhr => {
+            var location = xhr.getResponseHeader("Location");
+            if (location) {
+                var slices = xhr.getResponseHeader("Location").split("/");
+                return slices[slices.length - 1];
+            } else {
+                return "";
+            }
+        };
+
+        $.post("https://reservations.synxis.com/HMS/Rate/PricingCreate", $.param(params, false))
+            .then(function(data, status, xhr) {
+                deferred.resolve(idSplitter(xhr));
+            }).error(function(xhr) {
+                deferred.resolve(idSplitter(xhr));
             });
 
         return deferred.promise();
